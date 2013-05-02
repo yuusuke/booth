@@ -429,12 +429,14 @@ static int setup_transport(void)
 	int rv;
 	transport_layer_t proto = booth_conf->proto;
 
+	/* booth_udp_init() */
 	rv = booth_transport[proto].init(ticket_recv);
 	if (rv < 0) {
 		log_error("failed to init booth_transport[%d]", proto);
 		goto out;
 	}
 
+	/* booth_tcp_init() */
 	rv = booth_transport[TCP].init(NULL);
 	if (rv < 0) {
 		log_error("failed to init booth_transport[TCP]");
@@ -460,14 +462,17 @@ static int loop(void)
 	if (rv < 0)
 		goto fail;
 
+	/* ネットワーク通信用のソケットを準備 */
 	rv = setup_transport();
 	if (rv < 0)
 		goto fail;
 
+	/* チケット情報および、paxos情報の初期化 */
 	rv = setup_ticket();
 	if (rv < 0)
 		goto fail;
 
+	/* clientコマンドからの通信を受ける、UNIXソケットを準備 */
 	rv = setup_listener(BOOTHC_SOCK_PATH);
 	if (rv < 0)
 		goto fail;
