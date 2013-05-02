@@ -206,6 +206,7 @@ static void proposer_prepare(struct paxos_instance *pi, int *round)
 	hdr->proposer_id = hdr->from;
 	strcpy(hdr->psname, pi->ps->name);
 	strcpy(hdr->piname, pi->name);
+	/* 提案番号をメッセージに埋め込む */
 	hdr->ballot_number = htonl(ballot);
 	hdr->extralen = htonl(pi->ps->extralen);
 
@@ -227,6 +228,7 @@ static void proposer_prepare(struct paxos_instance *pi, int *round)
 	}
 
 	free(msg);
+	/* 現在のroundに提案番号を入れる。 */
 	*round = ballot;
 }
 
@@ -277,7 +279,7 @@ static void proposer_propose(struct paxos_space *ps,
 	pi->proposer->proposed = 1;
 
 	value = pi->proposer->proposal->value;
-	/* lease_propose() */
+	/* lease_propose()を実行する */
 	if (ps->p_op->propose
 		&& ps->p_op->propose(pih, extra, ballot, value) < 0)
 		return;
@@ -293,6 +295,7 @@ static void proposer_propose(struct paxos_space *ps,
 	memcpy((char *)message + msglen, value, ps->valuelen);
 	pi->proposer->state = PROPOSING;
 	hdr = message;
+	/* メッセージの送信者情報に自身のIDをセットする。 */
 	hdr->from = htonl(ps->p_op->get_myid());
 	hdr->state = htonl(PROPOSING);
 
@@ -340,7 +343,7 @@ static void proposer_commit(struct paxos_space *ps,
                 return;
 	}
 
-	/*  */
+	/* 提案を受諾したacceptorの数をカウントアップする */
 	pi->proposer->accepted_number++;
 
 	/* 提案をACCEPTING(受諾)したbooth数が全体の過半数を超えたかチェックする */
@@ -364,7 +367,7 @@ static void proposer_commit(struct paxos_space *ps,
 		pi->end(pih, pi->round, 0);	
 }
 
-/* 提案を約束(PROMISE)する関数 */
+/* 提案を約束する関数 */
 static void acceptor_promise(struct paxos_space *ps,
 			     struct paxos_instance *pi,
 			     void *msg, int msglen)
@@ -422,7 +425,7 @@ static void acceptor_promise(struct paxos_space *ps,
 	ps->p_op->send(to, msg, msglen);	
 }
 
-/* 提案を受諾(ACCEPT)する関数 */
+/* 提案を受諾する関数 */
 static void acceptor_accepted(struct paxos_space *ps,
 			      struct paxos_instance *pi,
 			      void *msg, int msglen)
@@ -468,6 +471,7 @@ static void acceptor_accepted(struct paxos_space *ps,
 
 	pi->acceptor->state = ACCEPTING;
 	to = ntohl(hdr->from);
+	/* メッセージの送信者情報に自身のIDをセットする。 */
 	hdr->from = htonl(myid);
 	hdr->state = htonl(ACCEPTING);
 
@@ -490,6 +494,7 @@ static void acceptor_accepted(struct paxos_space *ps,
 	}
 }
 
+/* 提案を習得する関数 */
 static void learner_response(struct paxos_space *ps,
 			     struct paxos_instance *pi,
 			     void *msg, int msglen)
@@ -736,6 +741,7 @@ out:
 	return rv;
 }
 
+/* 提案をprepareから開始する時に呼ばれる関数 */
 int paxos_round_request(pi_handle_t handle,
 			void *value,
 			int *round,
@@ -747,6 +753,10 @@ int paxos_round_request(pi_handle_t handle,
 	int myid = pi->ps->p_op->get_myid();
 	int rv = *round;
 
+	/*
+	 * 自分が提案可能なロール(PROPOSER)を持っていない場合、処理を取りやめる。
+	 * arbitratorで提案(PROPOSE)しようとした場合、ここで引っかかる。
+	 */
 	if (!(pi->ps->role[myid] & PROPOSER)) {
 		log_debug("only proposer can do this");
 		return -EOPNOTSUPP;
@@ -795,6 +805,7 @@ int paxos_recovery_status_set(pi_handle_t handle, int recovery)
 	return 0;
 }
 
+/* leaseの定期更新(renew_expires())の時に呼ばれる関数 */
 int paxos_propose(pi_handle_t handle, void *value, int round)
 {
 	struct paxos_instance *pi = (struct paxos_instance *)handle;
@@ -818,26 +829,30 @@ int paxos_propose(pi_handle_t handle, void *value, int round)
 
 	pi->proposer->state = PROPOSING;
 	strcpy(pi->proposer->proposal->value, value);
+	/* 提案の受諾数をクリアする。 */
 	pi->proposer->accepted_number = 0;
 	pi->round = round;
 
 	memset(msg, 0, len);
 	hdr = msg;
 	hdr->state = htonl(PROPOSING);
+	/* メッセージの送信者情報に自身のIDをセットする。 */
 	hdr->from = htonl(pi->ps->p_op->get_myid());
 	hdr->proposer_id = hdr->from;
 	strcpy(hdr->psname, pi->ps->name);
 	strcpy(hdr->piname, pi->name);
+	/* 現在のroundを提案番号とする */
 	hdr->ballot_number = htonl(pi->round);
 	hdr->extralen = htonl(pi->ps->extralen);
 	extra = (char *)msg + sizeof(struct paxos_msghdr);
 	memcpy((char *)msg + sizeof(struct paxos_msghdr) + pi->ps->extralen,
 		value, pi->ps->valuelen);
 
-	/* lease_propose() */
+	/* lease_propose()を呼び、次のrenew_expires()のタイマーを仕掛ける */
 	if (pi->ps->p_op->propose)
 		pi->ps->p_op->propose(handle, extra, round, value);
 
+	/* ticket_broadcast()を呼び、サイト全体にPROPOSINGメッセージを送信する */
 	if (pi->ps->p_op->broadcast)
 		pi->ps->p_op->broadcast(msg, len);
 	else {
@@ -856,6 +871,7 @@ int paxos_catchup(pi_handle_t handle)
 {
 	struct paxos_instance *pi = (struct paxos_instance *)handle;
 	
+	/* lease_catchup()を実行 */
 	return pi->ps->p_op->catchup(handle);
 }
 

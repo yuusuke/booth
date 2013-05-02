@@ -331,6 +331,10 @@ static int ticket_catchup(const void *name, int *owner, int *ballot,
 			}
 			log_debug("sent catchup command to %s", booth_conf->node[i].addr);
 			memset(tmsg, 0, sizeof(struct ticket_msg));
+			/* 
+			 * 現在バグにより、boothを同時に起動すると、
+			 * 複数のboothのcatchupがぶつかり、この部分でデッドロックが発生する(#1987)
+			 */
 			rv = booth_transport[TCP].recv(s, buf, buflen);
 			if (rv < 0) {
 				booth_transport[TCP].close(s);
@@ -615,6 +619,7 @@ int setup_ticket(void)
 	assert(myid < booth_conf->node_count);
 	if (role[myid] & ACCEPTOR) {
 		list_for_each_entry(tk, &ticket_list, list) {
+			/* ticket情報の初期化(catchup) */
 			ticket_status_recovery(tk->handle);
 		}
 	}

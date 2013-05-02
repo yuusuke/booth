@@ -132,6 +132,7 @@ static void end_paxos_request(pi_handle_t handle, int round, int result)
 	return;	
 }
 
+/* leaseの定期更新用の関数 */
 static void renew_expires(unsigned long data)
 {
 	struct paxos_lease *pl = (struct paxos_lease *)data;
@@ -151,6 +152,7 @@ static void renew_expires(unsigned long data)
 	paxos_propose(pl->pih, &value, pl->proposer.round);
 }
 
+/* leaseの有効期限が切れた時に実行される関数 */
 static void lease_expires(unsigned long data)
 {
 	struct paxos_lease *pl = (struct paxos_lease *)data;
@@ -159,13 +161,18 @@ static void lease_expires(unsigned long data)
 
 	log_info("lease expires ... owner [%d] ticket [%s]",
 		pl->owner, pl->name);
+	/* lease情報を初期化 */
 	pl->owner = -1;
 	strcpy(plr.name, pl->name);
 	plr.owner = -1;
 	plr.expires = 0;
 	plr.ballot = pl->acceptor.round;
+	/*
+	 * ticket_write()を呼び、クラスタにチケット情報を書き込む
+	 */
 	p_l_op->notify(plh, &plr);
 		
+	/* leaseに関するタイマーも全部解除 */
 	if (pl->proposer.timer1)
 		del_timer(&pl->proposer.timer1);
 	if (pl->proposer.timer2)
@@ -179,6 +186,8 @@ static void lease_expires(unsigned long data)
 		paxos_lease_acquire(plh, NOT_CLEAR_RELEASE, 1, NULL);
 }
 
+/* leaseの再取得を行う関数 */
+/* 再取得の試行は1回のみ */
 static void lease_retry(unsigned long data)
 {
 	struct paxos_lease *pl = (struct paxos_lease *)data;
@@ -231,9 +240,12 @@ int paxos_lease_acquire(pl_handle_t handle,
 
 	pl->action.op = OP_START_LEASE;
 	pl->action.clear = clear;
-	/* 提案番号を作って、paxos処理を開始する */
+	/* paxos処理を開始する */
 	round = paxos_round_request(pl->pih, &value, &pl->acceptor.round,
 				     end_paxos_request);
+	/* チケットの期限の1割の時間経過後、leaseが取れていない場合、
+	 * leaseの再取得が試行される
+	 */
 	pl->proposer.timer2 = add_timer(1 * pl->expiry / 10, (unsigned long)pl,
 					lease_retry);
 	if (round > 0)
@@ -241,6 +253,7 @@ int paxos_lease_acquire(pl_handle_t handle,
 	return (round < 0)? -1: round;
 }
 
+/* leaseの解放を行う関数 */
 int paxos_lease_release(pl_handle_t handle,
 			void (*end_release) (pl_handle_t handle, int result))
 {
@@ -255,12 +268,13 @@ int paxos_lease_release(pl_handle_t handle,
 		return -1;
 	}
 
+	/* lease情報を0でクリアする */
 	memset(&value, 0, sizeof(struct paxos_lease_value));
 	strncpy(value.name, pl->name, PAXOS_NAME_LEN + 1);
 	pl->end_lease = end_release;
 
 	pl->action.op = OP_STOP_LEASE;
-	/* 提案番号を作って、paxosを開始する */
+	/* paxos通信を開始する */
 	round = paxos_round_request(pl->pih, &value,
 					&pl->acceptor.round,
 					end_paxos_request);
@@ -271,6 +285,7 @@ int paxos_lease_release(pl_handle_t handle,
 	return (round < 0)? -1: round;
 }
 
+/* booth起動時にチケットを初期化するために呼ばれる関数 */
 static int lease_catchup(pi_handle_t handle)
 {
 	struct paxos_lease *pl;
@@ -279,6 +294,7 @@ static int lease_catchup(pi_handle_t handle)
 	if (!find_paxos_lease(handle, &pl))
 		return -1;
 
+	/* ticket_catchup()で他サイトとTCP通信を行い、paxosとleaseの状態を得る。 */
 	p_l_op->catchup(pl->name, &pl->owner, &pl->acceptor.round, &pl->expires);
 	log_debug("catchup result: name: %s, owner: %d, ballot: %d, expires: %llu",
 		  (char *)pl->name, pl->owner, pl->acceptor.round, pl->expires);
@@ -297,6 +313,10 @@ static int lease_catchup(pi_handle_t handle)
 	} else
 		pl->release = LEASE_STARTED;
 
+	/*
+	 * 現在時刻が、leaseの有効期限を超えていた場合、
+	 * leaseの状態は初期化される。
+	 */
 	if (current_time() > pl->expires) {
 		plr.owner = pl->owner = -1;
 		plr.expires = pl->expires = 0;
@@ -305,16 +325,29 @@ static int lease_catchup(pi_handle_t handle)
 		return 0;
 	}
 
+	/*
+	 * catchupの結果、自分がleaseのオーナーだとわかった場合、
+	 * leaseの継続(renew)を行う。
+	 */
 	if (pl->owner == myid) {
 		pl->acceptor.timer2 = add_timer(pl->expires - current_time(),
 						(unsigned long)pl,
 						lease_expires);
+		/*
+		 * 現在時刻がrenewの時刻を過ぎてしまっている場合は、renewのタイマーが仕掛けられない
+		 * 上記に当てはまると、有効期限のタイマー(lease_expires)が発動し、
+		 * leaseの取りなおしとなる。
+		 */
 		if (current_time() < pl->expires - 1 * pl->expiry / 5)
 			pl->proposer.timer1 = add_timer(pl->expires
 							- 1 * pl->expiry / 5
 							- current_time(),
 							(unsigned long)pl,
 							renew_expires);
+	/*
+	 * catchupの結果、他のboothがleaseのオーナーだとわかった場合、
+	 * leaseの有効期限を仕掛ける。
+	 */
 	} else
 		pl->acceptor.timer2 = add_timer(pl->expires - current_time(),
 						(unsigned long)pl,
@@ -324,6 +357,9 @@ static int lease_catchup(pi_handle_t handle)
 	plr.expires = pl->expires;
 	plr.ballot = pl->acceptor.round;
 	strcpy(plr.name, pl->name);
+	/*
+	 * ticket_write()を呼び、クラスタにチケット情報を書き込む
+	 */
 	p_l_op->notify((pl_handle_t)pl, &plr);
 
 	return 0;	
@@ -381,9 +417,11 @@ static int lease_is_prepared(pi_handle_t handle, void *header)
 	log_debug("enter lease_is_prepared");
 	assert(OP_START_LEASE == op || OP_STOP_LEASE == op);
 	switch (op) {
+	/* GRANTの場合はこちらの処理 */
 	case OP_START_LEASE:
 		ret = start_lease_is_prepared(handle, header);
 		break;
+	/* REVOKEの場合はこちらの処理 */
 	case OP_STOP_LEASE:
 		ret = stop_lease_is_prepared(handle, header);
 		break;
@@ -437,6 +475,7 @@ static int stop_lease_promise(pi_handle_t handle,
 	log_debug("enter stop_lease_promise");
 	if (!find_paxos_lease(handle, &pl))
 		return -1;
+	/* 本関数は特に何もしない(チケットの存在確認のみ)  */
 
 	log_debug("exit stop_lease_promise");
 	return 0;
@@ -451,9 +490,11 @@ static int lease_promise(pi_handle_t handle, void *header)
 	log_debug("enter lease_promise");
 	assert(OP_START_LEASE == op || OP_STOP_LEASE == op);
 	switch (op) {
+	/* GRANTの場合はこちらの処理 */
 	case OP_START_LEASE:
 		ret = start_lease_promise(handle, header);
 		break;
+	/* REVOKEの場合はこちらの処理 */
 	case OP_STOP_LEASE:
 		ret = stop_lease_promise(handle, header);
 		break;
@@ -524,6 +565,9 @@ static int stop_lease_propose(pi_handle_t handle,
 	if (!find_paxos_lease(handle, &pl))
 		return -1;
 
+	/* 提案しようとしているroundと記憶しているroundが不一致の場合
+	 * 提案を中止する
+	 */
 	if (round != pl->proposer.round) {
 		log_error("current round is not the proposer round, "
 			  "current round: %d, proposer round: %d",
@@ -538,6 +582,7 @@ static int stop_lease_propose(pi_handle_t handle,
 			return -ENOMEM;
 		}
 	}
+	/* valueにはpaxos_lease_release()でセットした0が入っている */
 	memcpy(pl->proposer.plv, value, sizeof(struct paxos_lease_value));
 
 	log_debug("exit stop_lease_propose");
@@ -554,11 +599,11 @@ static int lease_propose(pi_handle_t handle, void *extra,
 	log_debug("enter lease_propose");
 	assert(OP_START_LEASE == op || OP_STOP_LEASE == op);
 	switch (op) {
-	/* GRANTの場合はこっちの処理 */
+	/* GRANTの場合はこちらの処理 */
 	case OP_START_LEASE:
 		ret = start_lease_propose(handle, extra, round, value);
 		break;
-	/* REVOKEの場合はこっちの処理 */
+	/* REVOKEの場合はこちらの処理 */
 	case OP_STOP_LEASE:
 		ret = stop_lease_propose(handle, extra, round, value);
 		break;
@@ -638,11 +683,11 @@ static int lease_accepted(pi_handle_t handle, void *extra,
 	log_debug("enter lease_accepted");
 	assert(OP_START_LEASE == op || OP_STOP_LEASE == op);
 	switch (op) {
-	/* GRANTの場合はこっちの処理 */
+	/* GRANTの場合はこちらの処理 */
 	case OP_START_LEASE:
 		ret = start_lease_accepted(handle, extra, round, value);
 		break;
-	/* REVOKEの場合はこっちの処理 */
+	/* REVOKEの場合はこちらの処理 */
 	case OP_STOP_LEASE:
 		ret = stop_lease_accepted(handle, extra, round, value);
 		break;
@@ -740,9 +785,11 @@ static int lease_commit(pi_handle_t handle, void *extra, int round)
 	log_debug("enter lease_commit");
 	assert(OP_START_LEASE == op || OP_STOP_LEASE == op);
 	switch (op) {
+	/* GRANTの場合はこちらの処理 */
 	case OP_START_LEASE:
 		ret = start_lease_commit(handle, extra, round);
 		break;
+	/* REVOKEの場合はこちらの処理 */
 	case OP_STOP_LEASE:
 		ret = stop_lease_commit(handle, extra, round);
 		break;
@@ -813,6 +860,7 @@ static int stop_lease_learned(pi_handle_t handle,
 	if (!pl->acceptor.plv)
 		return -1;
 
+	/* leaseは解放されるので、有効期限のタイマーを解除する */
 	if (pl->acceptor.timer2)
 		del_timer(&pl->acceptor.timer2);
 	if (pl->acceptor.timer1)
@@ -840,11 +888,11 @@ static int lease_learned(pi_handle_t handle, void *extra, int round)
 	log_debug("enter lease_learned");
 	assert(OP_START_LEASE == op || OP_STOP_LEASE == op);
 	switch (op) {
-	/* GRANTの場合はこっちの処理 */
+	/* GRANTの場合はこちらの処理 */
 	case OP_START_LEASE:
 		ret = start_lease_learned(handle, extra, round);
 		break;
-	/* REVOKEの場合はこっちの処理 */
+	/* REVOKEの場合はこちらの処理 */
 	case OP_STOP_LEASE:
 		ret = stop_lease_learned(handle, extra, round);
 		break;
@@ -940,6 +988,7 @@ int paxos_lease_status_recovery(pl_handle_t handle)
 	if (paxos_recovery_status_get(pl->pih) == 1) {
 		pl->renew = 1;
 		if (paxos_catchup(pl->pih) == 0)
+			/* 初期化完了 */
 			paxos_recovery_status_set(pl->pih, 0);
 	}
 
