@@ -139,7 +139,12 @@ static int have_quorum(struct paxos_space *ps, int member)
 {
 	int i, sum = 0;
 
+	/* ps->numberにはboothの総数が入っている。 */
 	for (i = 0; i < ps->number; i++) {
+		/*
+		 * ACCEPTORロールを持っている物を数える
+		 * 現在のboothでは全てのboothがACCEPTORロールを持っている。
+		 * */
 		if (ps->role[i] & ACCEPTOR)
 			sum++;
 	}
@@ -166,6 +171,7 @@ static int next_ballot_number(struct paxos_instance *pi)
 	return ballot;
 }
 
+/* 提案の準備を行う関数 */
 static void proposer_prepare(struct paxos_instance *pi, int *round)
 {
 	struct paxos_msghdr *hdr;
@@ -186,10 +192,16 @@ static void proposer_prepare(struct paxos_instance *pi, int *round)
 
 	if (*round > pi->round)
 		pi->round = *round;
+	/* 
+	 * 提案に使う提案番号を生成する
+	 * 提案番号は基本的にサイトのIDを元に生成され、
+	 * 他のサイトの提案番号と被らないようになっている。
+	 */
 	ballot = next_ballot_number(pi);
 	pi->proposer->ballot = ballot;
 
 	hdr->state = htonl(PREPARING);
+	/* メッセージの送信者情報に自身のIDをセットする。 */
 	hdr->from = htonl(pi->ps->p_op->get_myid());
 	hdr->proposer_id = hdr->from;
 	strcpy(hdr->psname, pi->ps->name);
@@ -197,12 +209,15 @@ static void proposer_prepare(struct paxos_instance *pi, int *round)
 	hdr->ballot_number = htonl(ballot);
 	hdr->extralen = htonl(pi->ps->extralen);
 
+	/* lease_prepare()を呼び、送信メッセージのヘッダを完成させる */
 	if (pi->ps->p_op->prepare &&
 		pi->ps->p_op->prepare((pi_handle_t)pi, extra) < 0)
 		return;
 
+	/* ticket_broadcast()を呼び、サイト全体にPREPARINGメッセージを送信する */
 	if (pi->ps->p_op->broadcast)
 		pi->ps->p_op->broadcast(msg, msglen);
+	/* 現在、TCP通信は未実装なため、以下の処理には入らない */
 	else {
 		int i;
 		for (i = 0; i < pi->ps->number; i++) {
@@ -215,6 +230,7 @@ static void proposer_prepare(struct paxos_instance *pi, int *round)
 	*round = ballot;
 }
 
+/* 提案を行う関数 */
 static void proposer_propose(struct paxos_space *ps,
 			     struct paxos_instance *pi,
 			     void *msg, int msglen)
@@ -234,6 +250,7 @@ static void proposer_propose(struct paxos_space *ps,
 	}
 	hdr = msg;
 
+	/* 提案番号が自分の提案したものと違う場合は処理しない。 */
 	ballot = ntohl(hdr->ballot_number);
 	if (pi->proposer->ballot != ballot) {
 		log_debug("not the same ballot, proposer ballot: %d, "
@@ -242,20 +259,25 @@ static void proposer_propose(struct paxos_space *ps,
 	}
 
 	extra = (char *)msg + sizeof(struct paxos_msghdr);
+	/* acceptorが準備OKかどうか、lease_is_prepared()を呼び、確認する */
 	if (ps->p_op->is_prepared) {
 		if (ps->p_op->is_prepared(pih, extra))
+			/* 準備OKのacceptorの数をカウントアップする。 */
 			pi->proposer->open_number++;
 	} else
 		pi->proposer->open_number++;
 
+	/* 提案をPROMISING(約束)したbooth数が全体の過半数を超えたかチェックする */
 	if (!have_quorum(ps, pi->proposer->open_number))
 		return;
 
+	/* すでに提案済み(PROPOSINGメッセージを送った後)なら何もしない。 */
 	if (pi->proposer->proposed)
 		return;
 	pi->proposer->proposed = 1;
 
 	value = pi->proposer->proposal->value;
+	/* lease_propose() */
 	if (ps->p_op->propose
 		&& ps->p_op->propose(pih, extra, ballot, value) < 0)
 		return;
@@ -274,8 +296,10 @@ static void proposer_propose(struct paxos_space *ps,
 	hdr->from = htonl(ps->p_op->get_myid());
 	hdr->state = htonl(PROPOSING);
 
+	/* ticket_broadcast()を呼び、サイト全体にPROPOSINGメッセージを送信する */
 	if (ps->p_op->broadcast)
 		ps->p_op->broadcast(message, msglen + ps->valuelen);
+	/* 現在、TCP通信は未実装なため、以下の処理には入らない */
 	else {
 		int i;
 		for (i = 0; i < ps->number; i++) {
@@ -287,6 +311,7 @@ static void proposer_propose(struct paxos_space *ps,
 	free(message);
 }
 
+/* 提案を完遂する関数 */
 static void proposer_commit(struct paxos_space *ps,
 			    struct paxos_instance *pi,
 			    void *msg, int msglen)
@@ -315,8 +340,10 @@ static void proposer_commit(struct paxos_space *ps,
                 return;
 	}
 
+	/*  */
 	pi->proposer->accepted_number++;
 
+	/* 提案をACCEPTING(受諾)したbooth数が全体の過半数を超えたかチェックする */
 	if (!have_quorum(ps, pi->proposer->accepted_number))
 		return;
 
@@ -324,15 +351,20 @@ static void proposer_commit(struct paxos_space *ps,
 		return;
 
 	pi->round = ballot;
+	/*
+	 * lease_commit()を呼び、leaseを完遂させる。
+	 */
 	if (ps->p_op->commit
 		&& ps->p_op->commit(pih, extra, pi->round) < 0)
 		return;
 	pi->proposer->state = COMMITTED;
 
+	/* end_paxos_request() */
 	if (pi->end)
 		pi->end(pih, pi->round, 0);	
 }
 
+/* 提案を約束(PROMISE)する関数 */
 static void acceptor_promise(struct paxos_space *ps,
 			     struct paxos_instance *pi,
 			     void *msg, int msglen)
@@ -358,6 +390,11 @@ static void acceptor_promise(struct paxos_space *ps,
 	hdr = msg;
 	extra = (char *)msg + sizeof(struct paxos_msghdr);
 
+	/*
+	 * 提案番号(hdr->ballot_number)がすでに約束した番号より低い場合、 
+	 * メッセージの処理を終了する。
+	 * 提案者に対して応答を返さない。
+	 */ 
 	if (ntohl(hdr->ballot_number) < pi->acceptor->highest_promised) {
 		log_debug("ballot number: %d, highest promised: %d",
 			  ntohl(hdr->ballot_number),
@@ -365,18 +402,27 @@ static void acceptor_promise(struct paxos_space *ps,
 		return;
 	}
 
+	/* 
+	 * 提案メッセージに問題がない場合、lease_promise()を実行し、
+	 * 現在のlease状態を確認する。
+	 */
 	if (ps->p_op->promise
 		&& ps->p_op->promise(pih, extra) < 0)
 		return;
 
+	/* leaseが可能な状態の場合、highest_promisedを提案番号で更新する。 */
 	pi->acceptor->highest_promised = ntohl(hdr->ballot_number);
 	pi->acceptor->state = PROMISING;
+	/* メッセージの送り主を宛先にセットする。 */
 	to = ntohl(hdr->from);
+	/* メッセージの送信者情報に自身のIDをセットする。 */
 	hdr->from = htonl(ps->p_op->get_myid());
 	hdr->state = htonl(PROMISING);
+	/* ticket_send()を実行して、提案者に対してメッセージの返送を行う。 */
 	ps->p_op->send(to, msg, msglen);	
 }
 
+/* 提案を受諾(ACCEPT)する関数 */
 static void acceptor_accepted(struct paxos_space *ps,
 			      struct paxos_instance *pi,
 			      void *msg, int msglen)
@@ -415,6 +461,7 @@ static void acceptor_accepted(struct paxos_space *ps,
 	memcpy(value, (char *)msg + sizeof(struct paxos_msghdr) + ps->extralen,
 	       ps->valuelen);
 
+	/* lease_accepted()を呼び、受諾を確定させる */
 	if (ps->p_op->accepted
 		&& ps->p_op->accepted(pih, extra, ballot, value) < 0)
 		return;
@@ -424,9 +471,11 @@ static void acceptor_accepted(struct paxos_space *ps,
 	hdr->from = htonl(myid);
 	hdr->state = htonl(ACCEPTING);
 
+	/* ticket_broadcast()を呼び、サイト全体にACCEPTINGメッセージを送信する */
 	if (ps->p_op->broadcast)
 		ps->p_op->broadcast(msg, sizeof(struct paxos_msghdr)
 						+ ps->extralen);
+	/* 現在、TCP通信は未実装なため、以下の処理には入らない */
 	else {
 		int i;
 		for (i = 0; i < ps->number; i++) {
@@ -483,9 +532,16 @@ static void learner_response(struct paxos_space *ps,
 		pi->learner->learned[unused].number = 1;
 	}
 
+	/* 提案をACCEPTING(受諾)したbooth数が全体の過半数を超えたかチェックする */
+	/* 現在pi->learner->learned_maxは初期化されないため、
+	 * 延々加算されてしまうバグが存在する。(#2259)
+	 */
 	if (!have_quorum(ps, pi->learner->learned_max))
 		return;
 
+	/*
+	 * lease_learned()を呼び、lease情報を学習する
+	 */
 	if (ps->p_op->learned)
 		ps->p_op->learned(pih, extra, ballot);
 }
@@ -703,6 +759,7 @@ int paxos_round_request(pi_handle_t handle,
 	memcpy(pi->proposer->proposal->value, value, pi->ps->valuelen);
 
 	pi->end = end_request;
+	/* proposer_prepare()を呼び、提案を開始する */
 	pi->ps->r_op->prepare(pi, &rv);
 
 	return rv;
@@ -777,6 +834,7 @@ int paxos_propose(pi_handle_t handle, void *value, int round)
 	memcpy((char *)msg + sizeof(struct paxos_msghdr) + pi->ps->extralen,
 		value, pi->ps->valuelen);
 
+	/* lease_propose() */
 	if (pi->ps->p_op->propose)
 		pi->ps->p_op->propose(handle, extra, round, value);
 
@@ -801,6 +859,7 @@ int paxos_catchup(pi_handle_t handle)
 	return pi->ps->p_op->catchup(handle);
 }
 
+/* paxosメッセージの振り分け処理 */
 int paxos_recvmsg(void *msg, int msglen)
 {
 	struct paxos_msghdr *hdr = msg;
@@ -833,20 +892,25 @@ int paxos_recvmsg(void *msg, int msglen)
 		paxos_instance_init((ps_handle_t)ps, hdr->piname, NULL);
 
 	switch (ntohl(hdr->state)) {
+	/* メッセージの状態がPREPARINGならacceptor_promise()を実行する */
 	case PREPARING:
 		if (ps->role[myid] & ACCEPTOR)
 			ps->a_op->promise(ps, pi, msg, msglen);
 		break;
+	/* メッセージの状態がPROMISINGならproposer_propose()を実行する */
 	case PROMISING:
 		ps->r_op->propose(ps, pi, msg, msglen);
 		break;
+	/* メッセージの状態がPROPOSINGならacceptor_accepted()を実行する */
 	case PROPOSING:
 		if (ps->role[myid] & ACCEPTOR)
 			ps->a_op->accepted(ps, pi, msg, msglen);
 		break;
 	case ACCEPTING:
+		/* メッセージの状態がACCEPTINGでかつ、自分が提案者(PROPOSER)ならproposer_commit()を実行する */
 		if (ntohl(hdr->proposer_id) == myid)
 			ps->r_op->commit(ps, pi, msg, msglen);
+		/* メッセージの状態がACCEPTINGでかつ、自分がLEARNERならlearner_response()を実行する */
 		else if (ps->role[myid] & LEARNER)
 			ps->l_op->response(ps, pi, msg, msglen);
 		break;

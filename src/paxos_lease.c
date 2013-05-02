@@ -122,6 +122,10 @@ static void end_paxos_request(pi_handle_t handle, int round, int result)
 		return;
 	}
 
+	/* 
+	 * GRANT時はend_acquire()が呼ばれる。
+	 * REVOKE時はend_release()が呼ばれる。
+	 */
 	if (pl->end_lease)
 		pl->end_lease((pl_handle_t)pl, result);
 		
@@ -208,6 +212,7 @@ static void lease_retry(unsigned long data)
 		pl->proposer.round = round;
 }
 
+/* leaseの取得を行う関数 */
 int paxos_lease_acquire(pl_handle_t handle,
 			int clear,
 			int renew,
@@ -226,6 +231,7 @@ int paxos_lease_acquire(pl_handle_t handle,
 
 	pl->action.op = OP_START_LEASE;
 	pl->action.clear = clear;
+	/* 提案番号を作って、paxos処理を開始する */
 	round = paxos_round_request(pl->pih, &value, &pl->acceptor.round,
 				     end_paxos_request);
 	pl->proposer.timer2 = add_timer(1 * pl->expiry / 10, (unsigned long)pl,
@@ -254,6 +260,7 @@ int paxos_lease_release(pl_handle_t handle,
 	pl->end_lease = end_release;
 
 	pl->action.op = OP_STOP_LEASE;
+	/* 提案番号を作って、paxosを開始する */
 	round = paxos_round_request(pl->pih, &value,
 					&pl->acceptor.round,
 					end_paxos_request);
@@ -396,6 +403,7 @@ static int start_lease_promise(pi_handle_t handle, void *header)
 	if (!find_paxos_lease(handle, &pl))
 		return -1;
 
+	/* leaseの状態を返送メッセージに格納 */
 	if (NOT_CLEAR_RELEASE == clear && LEASE_STOPPED == pl->release) {
 		log_debug("could not be leased");
 		hdr->leased = 1;
@@ -407,6 +415,11 @@ static int start_lease_promise(pi_handle_t handle, void *header)
 		hdr->leased = 1;
 	}
 
+	/*
+	 * "master lease"の概念で取り込んでもらった実装
+	 * lease済みの状態でPREPARINGメッセージを受信したときは
+	 * 提案が衝突したと見なして、proposerに何も返さない。
+	 */
 	if (hdr->leased == 1) {
 		log_error("the proposal collided");
 		return -1;
@@ -459,6 +472,9 @@ static int start_lease_propose(pi_handle_t handle, void *extra,
 	if (!find_paxos_lease(handle, &pl))
 		return -1;
 
+	/* 提案しようとしているroundと記憶しているroundが不一致の場合
+	 * 提案を中止する
+	 */
 	if (round != pl->proposer.round) {
 		log_error("current round is not the proposer round, "
 			  "current round: %d, proposer round: %d",
@@ -478,6 +494,10 @@ static int start_lease_propose(pi_handle_t handle, void *extra,
 	if (pl->proposer.timer1)
 		del_timer(&pl->proposer.timer1);
 
+	/* 
+	 * renew用のタイマーを仕掛ける
+	 * timer = チケットの期限の80%の時間
+	 */
 	if (pl->renew) {
 		pl->proposer.timer1 = add_timer(4 * pl->expiry / 5,
 						(unsigned long)pl,
@@ -534,9 +554,11 @@ static int lease_propose(pi_handle_t handle, void *extra,
 	log_debug("enter lease_propose");
 	assert(OP_START_LEASE == op || OP_STOP_LEASE == op);
 	switch (op) {
+	/* GRANTの場合はこっちの処理 */
 	case OP_START_LEASE:
 		ret = start_lease_propose(handle, extra, round, value);
 		break;
+	/* REVOKEの場合はこっちの処理 */
 	case OP_STOP_LEASE:
 		ret = stop_lease_propose(handle, extra, round, value);
 		break;
@@ -574,6 +596,7 @@ static int start_lease_accepted(pi_handle_t handle, void *extra,
 
 	if (pl->acceptor.timer1 && pl->acceptor.timer2 != pl->acceptor.timer1)
 		del_timer(&pl->acceptor.timer1);
+	/* ticketの有効期限タイマーをセット */
 	pl->acceptor.timer1 = add_timer(pl->expiry, (unsigned long)pl,
 					lease_expires);
 	pl->acceptor.expires = current_time() + pl->expiry;
@@ -615,9 +638,11 @@ static int lease_accepted(pi_handle_t handle, void *extra,
 	log_debug("enter lease_accepted");
 	assert(OP_START_LEASE == op || OP_STOP_LEASE == op);
 	switch (op) {
+	/* GRANTの場合はこっちの処理 */
 	case OP_START_LEASE:
 		ret = start_lease_accepted(handle, extra, round, value);
 		break;
+	/* REVOKEの場合はこっちの処理 */
 	case OP_STOP_LEASE:
 		ret = stop_lease_accepted(handle, extra, round, value);
 		break;
@@ -646,6 +671,9 @@ static int start_lease_commit(pi_handle_t handle, void *extra, int round)
 	pl->release = LEASE_STARTED;
 	pl->owner = pl->proposer.plv->owner;
 	pl->expiry = pl->proposer.plv->expiry;
+	/*
+	 * timer1(一時保存)をtimer2(保存)に移動
+	 */
 	if (pl->acceptor.timer2 != pl->acceptor.timer1) {
 		if (pl->acceptor.timer2)
 			del_timer(&pl->acceptor.timer2);
@@ -656,6 +684,9 @@ static int start_lease_commit(pi_handle_t handle, void *extra, int round)
 	plr.owner = pl->proposer.plv->owner;
 	plr.expires = current_time() + pl->proposer.plv->expiry;
 	plr.ballot = round;
+	/*
+	 * ticket_write()を呼び、クラスタにチケット情報を書き込む
+	 */
 	p_l_op->notify((pl_handle_t)pl, &plr);
 
 	log_debug("exit start_lease_commit");
@@ -753,6 +784,9 @@ static int start_lease_learned(pi_handle_t handle, void *extra, int round)
 	plr.owner = pl->acceptor.plv->owner;
 	plr.expires = current_time() + pl->acceptor.plv->expiry;
 	plr.ballot = round;
+	/*
+	 * ticket_write()を呼び、クラスタにチケット情報を書き込む
+	 */
 	p_l_op->notify((pl_handle_t)pl, &plr);
 	log_debug("exit start_lease_learned");
 	return 0;
@@ -789,6 +823,9 @@ static int stop_lease_learned(pi_handle_t handle,
 	plr.owner = pl->owner = -1;
 	plr.ballot = round;
 	plr.expires = 0;
+	/*
+	 * ticket_write()を呼び、クラスタにチケット情報を書き込む
+	 */
 	p_l_op->notify((pl_handle_t)pl, &plr);
 	log_debug("exit stop_lease_learned");
 	return 0;
@@ -803,9 +840,11 @@ static int lease_learned(pi_handle_t handle, void *extra, int round)
 	log_debug("enter lease_learned");
 	assert(OP_START_LEASE == op || OP_STOP_LEASE == op);
 	switch (op) {
+	/* GRANTの場合はこっちの処理 */
 	case OP_START_LEASE:
 		ret = start_lease_learned(handle, extra, round);
 		break;
+	/* REVOKEの場合はこっちの処理 */
 	case OP_STOP_LEASE:
 		ret = stop_lease_learned(handle, extra, round);
 		break;

@@ -116,6 +116,8 @@ static int ticket_get_myid(void)
 	return booth_transport[booth_conf->proto].get_myid();
 }
 
+/* GRANtの成否をログに出力する */
+/* 今のところ変数errorが0以外で呼び出されることはない */
 static void end_acquire(pl_handle_t handle, int error)
 {
 	struct ticket *tk;
@@ -143,6 +145,8 @@ static void end_acquire(pl_handle_t handle, int error)
 	log_debug("exit end_acquire");
 }
 
+/* REVOKEの成否をログに出力する */
+/* 今のところ変数errorが0以外で呼び出されることはない */
 static void end_release(pl_handle_t handle, int error)
 {
 	struct ticket *tk;
@@ -385,9 +389,11 @@ static int ticket_write(pl_handle_t handle, struct paxos_lease_result *result)
 	tk->expires = result->expires;
 	tk->ballot = result->ballot;
 
+	/* チケットのownerが自分の場合、チケットをGRANT状態にする */
 	if (tk->owner == ticket_get_myid()) {
 		pcmk_handler.store_ticket(tk->id, tk->owner, tk->ballot, tk->expires);
 		pcmk_handler.grant_ticket(tk->id);
+	/* チケットのownerが"-1"の場合、チケットをREVOKE状態にする */
 	} else if (tk->owner == -1) {
 		pcmk_handler.store_ticket(tk->id, tk->owner, tk->ballot, tk->expires);
 		pcmk_handler.revoke_ticket(tk->id);
@@ -419,6 +425,7 @@ int ticket_recv(void *msg, int msglen)
 				      msglen - sizeof(struct booth_msghdr));
 }
 
+/* "booth client grant"が実行された際に実行される入り口 */
 int grant_ticket(char *ticket)
 {
 	struct ticket *tk;
@@ -439,6 +446,7 @@ int grant_ticket(char *ticket)
 	if (tk->owner == ticket_get_myid())
 		return BOOTHC_RLT_SYNC_SUCC;
 	else {
+		/* lease取得 */
 		int ret = paxos_lease_acquire(tk->handle, CLEAR_RELEASE,
 				1, end_acquire);
 		if (ret >= 0)
@@ -447,6 +455,7 @@ int grant_ticket(char *ticket)
 	}
 }
 
+/* "booth client revoke"が実行された際に実行される入り口 */
 int revoke_ticket(char *ticket)
 {
 	struct ticket *tk;
@@ -467,6 +476,7 @@ int revoke_ticket(char *ticket)
 	if (tk->owner == -1)
 		return BOOTHC_RLT_SYNC_SUCC;
 	else {
+		/* lease解放 */
 		int ret = paxos_lease_release(tk->handle, end_release);
 		if (ret >= 0)
 			tk->ballot = ret;
